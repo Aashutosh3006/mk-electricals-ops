@@ -1,0 +1,44 @@
+{
+  "expo": {
+    "name": "MK Electricals Operations v2",
+    "slug": "mk-electricals-operations-v2",
+    "version": "2.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "primaryColor": "#4D0612",
+    "splash": {
+      "image": "./assets/splash.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#2B0309"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.mkelectricals.operations.v2",
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "MK Electricals requires your GPS location to verify 100m site geofence attendance and live team tracking."
+      }
+    },
+    "android": {
+      "package": "com.mkelectricals.operations.v2",
+      "versionCode": 2,
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/icon.png",
+        "backgroundColor": "#2B0309"
+      },
+      "permissions": [
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_BACKGROUND_LOCATION"
+      ]
+    },
+    "plugins": [
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "Allow MK Electricals Operations App v2 to verify your site geofence attendance."
+        }
+      ]
+    ]
+  }
+}
