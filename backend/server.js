@@ -2,11 +2,19 @@ const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const Database = require('better-sqlite3');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'mk_electricals.db');
+const SESSION_SECRET = process.env.SESSION_SECRET || (
+  process.env.NODE_ENV === 'production' ? '' : crypto.randomBytes(32).toString('hex')
+);
+const OWNER_USER_ID = process.env.OWNER_USER_ID || 'mkelectricals';
+const OWNER_PASSWORD = process.env.OWNER_PASSWORD;
+if (!SESSION_SECRET) throw new Error('Set SESSION_SECRET before starting the production API.');
+if (!OWNER_PASSWORD) throw new Error('Set OWNER_PASSWORD before starting the API.');
 
 app.use(cors());
 app.use(express.json({ limit: '5mb' }));
@@ -14,11 +22,83 @@ app.use(express.json({ limit: '5mb' }));
 // Initialize SQLite database
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
+db.pragma('foreign_keys = ON');
+
+function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
+  const hash = crypto.scryptSync(password, salt, 64).toString('hex');
+  return `scrypt:${salt}:${hash}`;
+}
+
+function passwordMatches(password, storedValue) {
+  if (typeof password !== 'string' || typeof storedValue !== 'string') return false;
+  const [scheme, salt, storedHash] = storedValue.split(':');
+  if (scheme === 'scrypt' && salt && storedHash) {
+    const candidate = crypto.scryptSync(password, salt, 64);
+    const expected = Buffer.from(storedHash, 'hex');
+    return candidate.length === expected.length && crypto.timingSafeEqual(candidate, expected);
+  }
+  const candidate = crypto.createHash('sha256').update(password).digest();
+  const expected = crypto.createHash('sha256').update(storedValue).digest();
+  return crypto.timingSafeEqual(candidate, expected);
+}
+
+function createAccessToken(user) {
+  const payload = Buffer.from(JSON.stringify({
+    sub: user.id,
+    role: user.user_type,
+    exp: Date.now() + 12 * 60 * 60 * 1000,
+  })).toString('base64url');
+  const signature = crypto.createHmac('sha256', SESSION_SECRET).update(payload).digest('base64url');
+  return `${payload}.${signature}`;
+}
+
+function requireAuth(req, res, next) {
+  const authorization = req.get('authorization') || '';
+  const [scheme, token] = authorization.split(' ');
+  if (scheme !== 'Bearer' || !token) {
+    return res.status(401).json({ error: 'Sign in to continue.' });
+  }
+  const [payload, signature] = token.split('.');
+  if (!payload || !signature) {
+    return res.status(401).json({ error: 'Invalid session. Please sign in again.' });
+  }
+  const expected = crypto.createHmac('sha256', SESSION_SECRET).update(payload).digest();
+  let actual;
+  try {
+    actual = Buffer.from(signature, 'base64url');
+  } catch {
+    return res.status(401).json({ error: 'Invalid session. Please sign in again.' });
+  }
+  if (expected.length !== actual.length || !crypto.timingSafeEqual(expected, actual)) {
+    return res.status(401).json({ error: 'Invalid session. Please sign in again.' });
+  }
+  try {
+    const claims = JSON.parse(Buffer.from(payload, 'base64url').toString());
+    if (!claims.sub || !claims.exp || claims.exp <= Date.now()) {
+      return res.status(401).json({ error: 'Session expired. Please sign in again.' });
+    }
+    const user = db.prepare("SELECT id, user_type FROM staff WHERE id = ? AND status = 'Active'").get(claims.sub);
+    if (!user || user.user_type !== claims.role) {
+      return res.status(401).json({ error: 'Account unavailable. Please sign in again.' });
+    }
+    req.user = { id: user.id, role: user.user_type };
+    next();
+  } catch {
+    return res.status(401).json({ error: 'Invalid session. Please sign in again.' });
+  }
+}
+
+function requireOwner(req, res, next) {
+  if (req.user?.role !== 'owner') {
+    return res.status(403).json({ error: 'Only the owner can manage employee accounts.' });
+  }
+  next();
+}
 
 const schemaSql = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8');
 db.exec(schemaSql);
 
-// Seed initial data matching MK Electricals Operations App v2 mockup if empty
+// Seed starter records for a new installation; existing operational data is never overwritten.
 function seedDatabaseIfEmpty() {
   const staffCount = db.prepare('SELECT COUNT(*) AS cnt FROM staff').get().cnt;
   if (staffCount > 0 && !process.argv.includes('--reseed')) return;
@@ -30,60 +110,70 @@ function seedDatabaseIfEmpty() {
   insertSite.run('Phoenix Residency - Site B', 'Kothrud, Pune', 18.5074, 73.8077, 120, 54);
   insertSite.run('Orion Tech Park - Site C', 'Hinjawadi, Pune', 18.5913, 73.7389, 150, 91);
 
-  const insertStaff = db.prepare(`
+  db.prepare(`
     INSERT INTO staff (id, name, role, user_type, password_hash, site, updated, accuracy, lat, lng, dept, joining_date, status)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-  insertStaff.run('EMP001', 'Rohit Sharma', 'Electrician', 'employee', 'mk2026', 'At Site A', '2 min ago', '±6 m', 18.5204, 73.8567, 'Site Execution', '12 Jan 2025', 'Active');
-  insertStaff.run('EMP002', 'Ajay Verma', 'Sr. Wireman', 'employee', 'mk2026', 'At Site A', '4 min ago', '±8 m', 18.5235, 73.8525, 'Site Execution', '04 Mar 2025', 'Active');
-  insertStaff.run('EMP003', 'Sandeep Yadav', 'Panel Technician', 'employee', 'mk2026', 'At Site B', '5 min ago', '±5 m', 18.5162, 73.8610, 'HT/LT Panels', '19 May 2025', 'Active');
-  insertStaff.run('EMP004', 'Vikram Patil', 'Site Supervisor', 'employee', 'mk2026', 'At Site A', '1 min ago', '±6 m', 18.5179, 73.8512, 'Supervision', '10 Nov 2024', 'Active');
-  insertStaff.run('OWN001', 'Mr. Manish Kumar', 'Owner', 'owner', 'owner2026', 'HQ / All Sites', 'Just now', '±5 m', 18.5204, 73.8567, 'Management', '01 Jan 2020', 'Active');
+    VALUES (?, 'MK Electricals Owner', 'Owner', 'owner', ?, 'HQ / All Sites', '', '', 18.5204, 73.8567, 'Management', ?, 'Active')
+  `).run(OWNER_USER_ID, hashPassword(OWNER_PASSWORD), new Date().toISOString().slice(0, 10));
 
   db.prepare('INSERT INTO boq_norms (id, coil15, coil25, coil40, mcb_ratio) VALUES (1, 0.15, 0.25, 0.35, 0.20)').run();
 
-  const insertRoom = db.prepare(`
-    INSERT INTO boq_rooms (id, site_name, name, light, fan, plug6A, power16A, ac)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-  insertRoom.run('r1', 'MK Tower - Site A', 'Living Room', 5, 2, 3, 1, 1);
-  insertRoom.run('r2', 'MK Tower - Site A', 'Bedroom 1', 6, 2, 6, 2, 2);
-  insertRoom.run('r3', 'MK Tower - Site A', 'Bedroom 2', 6, 2, 5, 2, 1);
-  insertRoom.run('r4', 'MK Tower - Site A', 'Kitchen', 3, 1, 3, 4, 0);
-  insertRoom.run('r5', 'MK Tower - Site A', 'Balcony', 3, 0, 1, 0, 0);
-  insertRoom.run('b1', 'Phoenix Residency - Site B', 'Living Room', 6, 2, 4, 1, 1);
-  insertRoom.run('b2', 'Phoenix Residency - Site B', 'Master Bedroom', 5, 1, 5, 2, 1);
-
-  const insertTool = db.prepare(`
-    INSERT INTO tools_custody (id, name, type, issued_to, issue_date, status, serial, signed_by, signature_path)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-  const seedTools = [
-    ['T01', 'Drill Machine', 'drill', 'Rohit Sharma', '24 Oct 2026', 'issued', 'MK-DRL-104'],
-    ['T02', 'Multimeter', 'meter', 'Ajay Verma', '22 Oct 2026', 'issued', 'MK-DMM-209'],
-    ['T03', 'Cable Puller', 'puller', 'Sandeep Yadav', '20 Oct 2026', 'issued', 'MK-CPL-088'],
-    ['T04', 'Insulation Tester', 'meter', 'Kiran Deshmukh', '19 Oct 2026', 'issued', 'MK-MEG-311'],
-    ['T05', 'Rotary Hammer', 'drill', 'Rohit Sharma', '18 Oct 2026', 'issued', 'MK-RHM-112'],
-    ['T06', 'Clamp Meter', 'meter', 'Vikram Patil', '17 Oct 2026', 'issued', 'MK-CLM-401'],
-    ['T07', 'Hydraulic Crimper', 'puller', 'Sandeep Yadav', '15 Oct 2026', 'issued', 'MK-CRM-055'],
-    ['T08', 'Laser Distance Meter', 'meter', 'Vikram Patil', '14 Oct 2026', 'issued', 'MK-LDM-019'],
-    ['T09', 'Earth Resistance Kit', 'meter', 'Kiran Deshmukh', '12 Oct 2026', 'issued', 'MK-ERT-072'],
-    ['T10', 'Conduit Bender', 'puller', 'Ajay Verma', '10 Oct 2026', 'issued', 'MK-CND-133'],
-    ['T11', 'Wall Chaser Cutter', 'drill', 'Rohit Sharma', '08 Oct 2026', 'issued', 'MK-WCH-091'],
-    ['T12', 'Phase Sequence Meter', 'meter', 'Kiran Deshmukh', '05 Oct 2026', 'issued', 'MK-PSM-204'],
-    ['T13', 'Digital Lux Meter', 'meter', 'Vikram Patil', '01 Oct 2026', 'returned', 'MK-LUX-012'],
-  ];
-  seedTools.forEach((t) => insertTool.run(...t, null, null));
-
-  db.prepare(`
-    INSERT INTO attendance_logs (staff_id, site_name, action_type, distance_m, inside_geofence, logged_at)
-    VALUES ('EMP001', 'MK Tower - Site A', 'CHECK_IN', 18, 1, '09:02 AM')
-  `).run();
-
-  console.log('SQLite database seeded with MK Electricals Operations v2 records.');
+  console.log('SQLite database initialized with sites and an owner account.');
 }
 
 seedDatabaseIfEmpty();
+
+function ensureOwnerAccount() {
+  const transaction = db.transaction(() => {
+    let owner = db.prepare("SELECT * FROM staff WHERE id = ? AND user_type = 'owner'").get(OWNER_USER_ID);
+    if (!owner) {
+      owner = db.prepare("SELECT * FROM staff WHERE id = 'OWN001' AND user_type = 'owner'").get();
+      if (owner && owner.id !== OWNER_USER_ID) {
+        const conflictingAccount = db.prepare('SELECT id FROM staff WHERE id = ?').get(OWNER_USER_ID);
+        if (conflictingAccount) throw new Error(`Cannot migrate owner account: ${OWNER_USER_ID} is already in use.`);
+        db.prepare(`
+          INSERT INTO staff (id, name, role, user_type, password_hash, site, updated, accuracy, lat, lng, dept, joining_date, status)
+          VALUES (?, ?, ?, 'owner', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          OWNER_USER_ID,
+          owner.name,
+          owner.role,
+          hashPassword(OWNER_PASSWORD),
+          owner.site,
+          owner.updated,
+          owner.accuracy,
+          owner.lat,
+          owner.lng,
+          owner.dept,
+          owner.joining_date,
+          owner.status
+        );
+        db.prepare('UPDATE attendance_logs SET staff_id = ? WHERE staff_id = ?').run(OWNER_USER_ID, owner.id);
+        db.prepare('DELETE FROM staff WHERE id = ?').run(owner.id);
+      }
+    }
+    const ownerRecord = db.prepare("SELECT id FROM staff WHERE id = ? AND user_type = 'owner'").get(OWNER_USER_ID);
+    if (ownerRecord) {
+      db.prepare('UPDATE staff SET password_hash = ?, status = ? WHERE id = ?')
+        .run(hashPassword(OWNER_PASSWORD), 'Active', OWNER_USER_ID);
+    } else {
+      const mainSite = db.prepare('SELECT lat, lng FROM sites ORDER BY name LIMIT 1').get();
+      db.prepare(`
+        INSERT INTO staff (id, name, role, user_type, password_hash, site, updated, accuracy, lat, lng, dept, joining_date, status)
+        VALUES (?, ?, 'Owner', 'owner', ?, 'HQ / All Sites', '', '', ?, ?, 'Management', ?, 'Active')
+      `).run(
+        OWNER_USER_ID,
+        'MK Electricals Owner',
+        hashPassword(OWNER_PASSWORD),
+        mainSite?.lat || 0,
+        mainSite?.lng || 0,
+        new Date().toISOString().slice(0, 10)
+      );
+    }
+  });
+  transaction();
+}
+
+ensureOwnerAccount();
 
 // Haversine formula to compute distance in meters between 2 GPS coordinates
 function computeDistanceMeters(lat1, lon1, lat2, lon2) {
@@ -104,20 +194,28 @@ app.get('/api/health', (req, res) => {
 
 // 2. Auth Login
 app.post('/api/auth/login', (req, res) => {
-  const { empId, password } = req.body;
-  const user = db.prepare('SELECT * FROM staff WHERE id = ?').get(empId);
-  if (!user) {
-    return res.status(401).json({ error: 'Invalid Employee/Owner ID' });
+  const { empId, password } = req.body || {};
+  if (typeof empId !== 'string' || !empId.trim() || typeof password !== 'string' || !password) {
+    return res.status(400).json({ error: 'Enter your staff ID and password.' });
+  }
+  const user = db.prepare('SELECT * FROM staff WHERE id = ?').get(empId.trim());
+  if (!user || user.status !== 'Active' || !passwordMatches(password, user.password_hash)) {
+    return res.status(401).json({ error: 'Incorrect staff ID or password.' });
   }
   return res.json({
+    authenticated: true,
+    token: createAccessToken(user),
     id: user.id,
     name: user.name,
     role: user.role,
     userType: user.user_type,
     dept: user.dept,
     joiningDate: user.joining_date,
+    status: user.status,
   });
 });
+
+app.use('/api', requireAuth);
 
 // 3. Full Synced State Snapshot
 app.get('/api/state', (req, res) => {
@@ -126,9 +224,15 @@ app.get('/api/state', (req, res) => {
   const rawRooms = db.prepare('SELECT * FROM boq_rooms').all();
   const normsRow = db.prepare('SELECT * FROM boq_norms WHERE id = 1').get();
   const tools = db.prepare('SELECT * FROM tools_custody ORDER BY rowid DESC').all();
-  const latestAttendance = db
-    .prepare('SELECT * FROM attendance_logs WHERE staff_id = ? ORDER BY id DESC LIMIT 1')
-    .get('EMP001');
+  const requestedStaffId = typeof req.query.staffId === 'string' ? req.query.staffId : '';
+  const staffId = req.user.role === 'employee'
+    ? req.user.id
+    : requestedStaffId || staff[0]?.id;
+  const latestAttendance = staffId
+    ? db
+        .prepare('SELECT * FROM attendance_logs WHERE staff_id = ? ORDER BY id DESC LIMIT 1')
+        .get(staffId)
+    : undefined;
 
   const roomsBySite = {};
   rawRooms.forEach((r) => {
@@ -181,21 +285,73 @@ app.get('/api/state', (req, res) => {
   });
 });
 
+app.post('/api/staff', requireOwner, (req, res) => {
+  const { id, name, password, role, dept, siteName } = req.body || {};
+  if (
+    typeof id !== 'string' ||
+    !/^[A-Za-z0-9_-]{3,30}$/.test(id.trim()) ||
+    typeof name !== 'string' ||
+    !name.trim() ||
+    typeof password !== 'string' ||
+    password.length < 8 ||
+    typeof role !== 'string' ||
+    !role.trim() ||
+    typeof dept !== 'string' ||
+    !dept.trim() ||
+    typeof siteName !== 'string'
+  ) {
+    return res.status(400).json({ error: 'Enter an ID, name, role, department, site, and a password of at least 8 characters.' });
+  }
+  const site = db.prepare('SELECT * FROM sites WHERE name = ?').get(siteName);
+  if (!site) return res.status(400).json({ error: 'Select a valid site.' });
+  if (db.prepare('SELECT 1 FROM staff WHERE id = ?').get(id.trim())) {
+    return res.status(409).json({ error: 'That employee ID is already in use.' });
+  }
+
+  const joiningDate = new Date().toISOString().slice(0, 10);
+  db.prepare(`
+    INSERT INTO staff (id, name, role, user_type, password_hash, site, updated, accuracy, lat, lng, dept, joining_date, status)
+    VALUES (?, ?, ?, 'employee', ?, ?, 'Never', '—', ?, ?, ?, ?, 'Active')
+  `).run(
+    id.trim(),
+    name.trim(),
+    role.trim(),
+    hashPassword(password),
+    siteName,
+    site.lat,
+    site.lng,
+    dept.trim(),
+    joiningDate
+  );
+  const created = db.prepare(`
+    SELECT id, name, role, site, updated, accuracy, lat, lng, dept, joining_date AS joiningDate, status
+    FROM staff WHERE id = ?
+  `).get(id.trim());
+  res.status(201).json(created);
+});
+
 // 4. Attendance Check-In / Check-Out with Geofence Verification
 app.post('/api/attendance', (req, res) => {
-  const { staffId = 'EMP001', siteName = 'MK Tower - Site A', actionType = 'CHECK_IN', lat, lng, distanceMeters } = req.body;
-  const site = db.prepare('SELECT * FROM sites WHERE name = ?').get(siteName) || {
-    lat: 18.5204,
-    lng: 73.8567,
-    geofence_radius_m: 100,
-  };
-
-  const dist =
-    typeof distanceMeters === 'number'
-      ? distanceMeters
-      : lat && lng
-      ? computeDistanceMeters(lat, lng, site.lat, site.lng)
-      : 18;
+  const { staffId, siteName, actionType, lat, lng } = req.body || {};
+  if (req.user.role === 'employee' && req.user.id !== staffId) {
+    return res.status(403).json({ error: 'You can only record your own attendance.' });
+  }
+  if (
+    typeof staffId !== 'string' ||
+    typeof siteName !== 'string' ||
+    !['CHECK_IN', 'CHECK_OUT'].includes(actionType) ||
+    !Number.isFinite(lat) ||
+    !Number.isFinite(lng) ||
+    Math.abs(lat) > 90 ||
+    Math.abs(lng) > 180
+  ) {
+    return res.status(400).json({ error: 'Valid staff, site, action, and GPS coordinates are required.' });
+  }
+  const staffMember = db.prepare("SELECT id FROM staff WHERE id = ? AND user_type = 'employee' AND status = 'Active'").get(staffId);
+  if (!staffMember) return res.status(404).json({ error: 'Active employee not found.' });
+  const site = db.prepare('SELECT * FROM sites WHERE name = ?').get(siteName);
+  if (!site) return res.status(404).json({ error: 'Site not found.' });
+  const dist = computeDistanceMeters(lat, lng, site.lat, site.lng);
   const inside = dist <= site.geofence_radius_m ? 1 : 0;
 
   if (actionType === 'CHECK_IN' && !inside) {
@@ -223,7 +379,17 @@ app.post('/api/attendance', (req, res) => {
 
 // 5. Add or Update Room in BOQ Survey
 app.post('/api/boq/rooms', (req, res) => {
-  const { id, siteName = 'MK Tower - Site A', name, light = 0, fan = 0, plug6A = 0, power16A = 0, ac = 0 } = req.body;
+  const { id, siteName, name, light = 0, fan = 0, plug6A = 0, power16A = 0, ac = 0 } = req.body || {};
+  const counts = [light, fan, plug6A, power16A, ac];
+  if (
+    typeof siteName !== 'string' ||
+    !db.prepare('SELECT 1 FROM sites WHERE name = ?').get(siteName) ||
+    typeof name !== 'string' ||
+    !name.trim() ||
+    counts.some((count) => !Number.isInteger(count) || count < 0)
+  ) {
+    return res.status(400).json({ error: 'Enter a room name and valid non-negative point counts for an existing site.' });
+  }
   const roomId = id || 'rm_' + Date.now();
   db.prepare(`
     INSERT OR REPLACE INTO boq_rooms (id, site_name, name, light, fan, plug6A, power16A, ac)
@@ -234,7 +400,7 @@ app.post('/api/boq/rooms', (req, res) => {
 });
 
 // 6. Update BOQ Wire/MCB Calculator Multiplier Norms
-app.put('/api/boq/norms', (req, res) => {
+app.put('/api/boq/norms', requireOwner, (req, res) => {
   const { coil15 = 0.15, coil25 = 0.25, coil40 = 0.35, mcbRatio = 0.2 } = req.body;
   db.prepare('UPDATE boq_norms SET coil15 = ?, coil25 = ?, coil40 = ?, mcb_ratio = ? WHERE id = 1').run(
     coil15,
@@ -248,7 +414,10 @@ app.put('/api/boq/norms', (req, res) => {
 // 7. Sign & Toggle Tool Custody Status (Issued <-> Returned)
 app.put('/api/tools/:id/toggle-status', (req, res) => {
   const { id } = req.params;
-  const { signaturePath } = req.body;
+  const { signaturePath } = req.body || {};
+  if (typeof signaturePath !== 'string' || !signaturePath.trim()) {
+    return res.status(400).json({ error: 'A signature is required to change tool custody.' });
+  }
   const tool = db.prepare('SELECT * FROM tools_custody WHERE id = ?').get(id);
   if (!tool) {
     return res.status(404).json({ error: 'Tool not found' });
@@ -273,7 +442,7 @@ app.put('/api/tools/:id/toggle-status', (req, res) => {
 });
 
 // 8. Issue New Tool / Meter with Signature
-app.post('/api/tools/issue', (req, res) => {
+app.post('/api/tools/issue', requireOwner, (req, res) => {
   const { name, type = 'meter', issuedTo, serial = 'MK-NEW-501', signaturePath } = req.body;
   const id = 'T' + Date.now();
   const issueDate = '10 Nov 2026';
@@ -289,13 +458,24 @@ app.post('/api/tools/issue', (req, res) => {
 
 // 9. Live Staff GPS Telemetry Ping
 app.post('/api/gps/ping', (req, res) => {
-  const { staffId = 'EMP001', lat, lng, accuracy = '±6 m', site = 'At Site A' } = req.body;
+  const { staffId, lat, lng, accuracy, site } = req.body || {};
+  if (
+    typeof staffId !== 'string' ||
+    !Number.isFinite(lat) ||
+    !Number.isFinite(lng) ||
+    Math.abs(lat) > 90 ||
+    Math.abs(lng) > 180
+  ) {
+    return res.status(400).json({ error: 'Valid staff ID and GPS coordinates are required.' });
+  }
+  const staffMember = db.prepare("SELECT id FROM staff WHERE id = ? AND user_type = 'employee'").get(staffId);
+  if (!staffMember) return res.status(404).json({ error: 'Employee not found.' });
   db.prepare('UPDATE staff SET lat = ?, lng = ?, accuracy = ?, site = ?, updated = ? WHERE id = ?').run(
     lat,
     lng,
     accuracy,
     site,
-    'Just now',
+    new Date().toISOString(),
     staffId
   );
   res.json({ ok: true, staffId, lat, lng });
